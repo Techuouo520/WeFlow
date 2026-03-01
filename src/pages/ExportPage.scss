@@ -51,36 +51,52 @@
   .path-value {
     border: 1px dashed var(--border-color);
     border-radius: 10px;
-    padding: 10px 12px;
+    background: var(--bg-secondary);
+    display: flex;
+    align-items: stretch;
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  .path-link {
+    border: none;
+    background: transparent;
     font-size: 13px;
     color: var(--text-primary);
-    background: var(--bg-secondary);
+    text-align: left;
+    padding: 10px 12px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
     min-width: 0;
     flex: 1;
-  }
-
-  .path-link {
     cursor: pointer;
-    text-align: left;
 
-    &:hover:not(:disabled) {
-      border-color: var(--primary);
+    &:hover {
       color: var(--primary);
     }
 
-    &:disabled {
-      cursor: not-allowed;
-      opacity: 0.65;
+    &:focus-visible {
+      outline: none;
     }
   }
 
-  .path-actions {
-    display: flex;
-    gap: 8px;
+  .path-change-btn {
+    border: none;
+    border-left: 1px dashed var(--border-color);
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 600;
+    padding: 0 12px;
+    cursor: pointer;
     flex-shrink: 0;
+
+    &:hover {
+      border-color: var(--primary);
+      color: var(--primary);
+    }
   }
 
   .write-layout-control {
@@ -1072,9 +1088,8 @@
       flex-wrap: wrap;
     }
 
-    .path-actions {
-      width: 100%;
-      justify-content: flex-end;
+    .path-inline-row > .secondary-btn {
+      margin-left: auto;
     }
   }
 

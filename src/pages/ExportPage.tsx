@@ -1174,7 +1174,6 @@ function ExportPage() {
       label: '朋友圈',
       stats: [
         { label: '朋友圈条数', value: snsStats.totalPosts },
-        { label: '好友数', value: snsStats.totalFriends },
         { label: '已导出朋友圈条数', value: snsExportedCount }
       ]
     }
@@ -1373,6 +1372,17 @@ function ExportPage() {
     () => visibleSessions.map(renderRow),
     [visibleSessions, selectedSessions, sessionMetrics, activeTab, runningSessionIds, queuedSessionIds, nowTick, lastExportBySession]
   )
+  const chooseExportFolder = useCallback(async () => {
+    const result = await window.electronAPI.dialog.openFile({
+      title: '选择导出目录',
+      properties: ['openDirectory']
+    })
+    if (!result.canceled && result.filePaths.length > 0) {
+      const nextPath = result.filePaths[0]
+      setExportFolder(nextPath)
+      await configService.setExportPath(nextPath)
+    }
+  }, [])
 
   return (
     <div className="export-board-page">
@@ -1381,36 +1391,22 @@ function ExportPage() {
           <div className="path-control">
             <span className="control-label">导出位置</span>
             <div className="path-inline-row">
-              <button
-                className="path-value path-link"
-                type="button"
-                title={exportFolder}
-                disabled={!exportFolder}
-                onClick={() => exportFolder && void window.electronAPI.shell.openPath(exportFolder)}
-              >
-                {exportFolder || '未设置'}
-              </button>
-              <div className="path-actions">
-                <button className="secondary-btn" onClick={() => exportFolder && void window.electronAPI.shell.openPath(exportFolder)}>
-                  <ExternalLink size={14} /> 打开
-                </button>
+              <div className="path-value">
                 <button
-                  className="secondary-btn"
-                  onClick={async () => {
-                    const result = await window.electronAPI.dialog.openFile({
-                      title: '选择导出目录',
-                      properties: ['openDirectory']
-                    })
-                    if (!result.canceled && result.filePaths.length > 0) {
-                      const nextPath = result.filePaths[0]
-                      setExportFolder(nextPath)
-                      await configService.setExportPath(nextPath)
-                    }
-                  }}
+                  className="path-link"
+                  type="button"
+                  title={exportFolder}
+                  onClick={() => void chooseExportFolder()}
                 >
-                  <FolderOpen size={14} /> 更换
+                  {exportFolder || '未设置'}
+                </button>
+                <button className="path-change-btn" type="button" onClick={() => void chooseExportFolder()}>
+                  更换
                 </button>
               </div>
+              <button className="secondary-btn" onClick={() => exportFolder && void window.electronAPI.shell.openPath(exportFolder)}>
+                <ExternalLink size={14} /> 打开
+              </button>
             </div>
           </div>
 
