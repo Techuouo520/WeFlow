@@ -38,6 +38,8 @@ export const CONFIG_KEYS = {
   EXPORT_LAST_SNS_POST_COUNT: 'exportLastSnsPostCount',
   EXPORT_SESSION_MESSAGE_COUNT_CACHE_MAP: 'exportSessionMessageCountCacheMap',
   EXPORT_SNS_STATS_CACHE_MAP: 'exportSnsStatsCacheMap',
+  CONTACTS_LOAD_TIMEOUT_MS: 'contactsLoadTimeoutMs',
+  CONTACTS_LIST_CACHE_MAP: 'contactsListCacheMap',
 
   // 安全
   AUTH_ENABLED: 'authEnabled',
@@ -462,6 +464,19 @@ export interface ExportSnsStatsCacheItem {
   totalFriends: number
 }
 
+export interface ContactsListCacheContact {
+  username: string
+  displayName: string
+  remark?: string
+  nickname?: string
+  type: 'friend' | 'group' | 'official' | 'former_friend' | 'other'
+}
+
+export interface ContactsListCacheItem {
+  updatedAt: number
+  contacts: ContactsListCacheContact[]
+}
+
 export async function getExportSessionMessageCountCache(scopeKey: string): Promise<ExportSessionMessageCountCacheItem | null> {
   if (!scopeKey) return null
   const value = await config.get(CONFIG_KEYS.EXPORT_SESSION_MESSAGE_COUNT_CACHE_MAP)
@@ -547,6 +562,92 @@ export async function setExportSnsStatsCache(
   }
 
   await config.set(CONFIG_KEYS.EXPORT_SNS_STATS_CACHE_MAP, map)
+}
+
+// 获取通讯录加载超时阈值（毫秒）
+export async function getContactsLoadTimeoutMs(): Promise<number> {
+  const value = await config.get(CONFIG_KEYS.CONTACTS_LOAD_TIMEOUT_MS)
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 1000 && value <= 60000) {
+    return Math.floor(value)
+  }
+  return 3000
+}
+
+// 设置通讯录加载超时阈值（毫秒）
+export async function setContactsLoadTimeoutMs(timeoutMs: number): Promise<void> {
+  const normalized = Number.isFinite(timeoutMs)
+    ? Math.min(60000, Math.max(1000, Math.floor(timeoutMs)))
+    : 3000
+  await config.set(CONFIG_KEYS.CONTACTS_LOAD_TIMEOUT_MS, normalized)
+}
+
+export async function getContactsListCache(scopeKey: string): Promise<ContactsListCacheItem | null> {
+  if (!scopeKey) return null
+  const value = await config.get(CONFIG_KEYS.CONTACTS_LIST_CACHE_MAP)
+  if (!value || typeof value !== 'object') return null
+  const rawMap = value as Record<string, unknown>
+  const rawItem = rawMap[scopeKey]
+  if (!rawItem || typeof rawItem !== 'object') return null
+
+  const rawUpdatedAt = (rawItem as Record<string, unknown>).updatedAt
+  const rawContacts = (rawItem as Record<string, unknown>).contacts
+  if (!Array.isArray(rawContacts)) return null
+
+  const contacts: ContactsListCacheContact[] = []
+  for (const raw of rawContacts) {
+    if (!raw || typeof raw !== 'object') continue
+    const item = raw as Record<string, unknown>
+    const username = typeof item.username === 'string' ? item.username.trim() : ''
+    if (!username) continue
+    const displayName = typeof item.displayName === 'string' ? item.displayName : username
+    const type = typeof item.type === 'string' ? item.type : 'other'
+    contacts.push({
+      username,
+      displayName,
+      remark: typeof item.remark === 'string' ? item.remark : undefined,
+      nickname: typeof item.nickname === 'string' ? item.nickname : undefined,
+      type: (type === 'friend' || type === 'group' || type === 'official' || type === 'former_friend' || type === 'other')
+        ? type
+        : 'other'
+    })
+  }
+
+  return {
+    updatedAt: typeof rawUpdatedAt === 'number' && Number.isFinite(rawUpdatedAt) ? rawUpdatedAt : 0,
+    contacts
+  }
+}
+
+export async function setContactsListCache(scopeKey: string, contacts: ContactsListCacheContact[]): Promise<void> {
+  if (!scopeKey) return
+  const current = await config.get(CONFIG_KEYS.CONTACTS_LIST_CACHE_MAP)
+  const map = current && typeof current === 'object'
+    ? { ...(current as Record<string, unknown>) }
+    : {}
+
+  const normalized: ContactsListCacheContact[] = []
+  for (const contact of contacts || []) {
+    const username = String(contact?.username || '').trim()
+    if (!username) continue
+    const displayName = String(contact?.displayName || username)
+    const type = contact?.type || 'other'
+    if (type !== 'friend' && type !== 'group' && type !== 'official' && type !== 'former_friend' && type !== 'other') {
+      continue
+    }
+    normalized.push({
+      username,
+      displayName,
+      remark: contact?.remark ? String(contact.remark) : undefined,
+      nickname: contact?.nickname ? String(contact.nickname) : undefined,
+      type
+    })
+  }
+
+  map[scopeKey] = {
+    updatedAt: Date.now(),
+    contacts: normalized
+  }
+  await config.set(CONFIG_KEYS.CONTACTS_LIST_CACHE_MAP, map)
 }
 
 // === 安全相关 ===

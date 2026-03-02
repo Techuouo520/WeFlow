@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback, useMemo, useRef, type UIEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Search, RefreshCw, X, User, Users, MessageSquare, Loader2, FolderOpen, Download, ChevronDown, MessageCircle, UserX } from 'lucide-react'
+import { Search, RefreshCw, X, User, Users, MessageSquare, Loader2, FolderOpen, Download, ChevronDown, MessageCircle, UserX, AlertTriangle, ClipboardList } from 'lucide-react'
 import { useChatStore } from '../stores/chatStore'
 import { toContactTypeCardCounts, useContactTypeCountsStore } from '../stores/contactTypeCountsStore'
+import * as configService from '../services/config'
 import './ContactsPage.scss'
 
 interface ContactInfo {
@@ -23,6 +24,26 @@ const AVATAR_ENRICH_BATCH_SIZE = 80
 const SEARCH_DEBOUNCE_MS = 120
 const VIRTUAL_ROW_HEIGHT = 76
 const VIRTUAL_OVERSCAN = 10
+const DEFAULT_CONTACTS_LOAD_TIMEOUT_MS = 3000
+
+interface ContactsLoadSession {
+    requestId: string
+    startedAt: number
+    attempt: number
+    timeoutMs: number
+}
+
+interface ContactsLoadIssue {
+    kind: 'timeout' | 'error'
+    title: string
+    message: string
+    reason: string
+    errorDetail?: string
+    occurredAt: number
+    elapsedMs: number
+}
+
+type ContactsDataSource = 'cache' | 'network' | null
 
 function ContactsPage() {
     const [contacts, setContacts] = useState<ContactInfo[]>([])
@@ -61,6 +82,53 @@ function ContactsPage() {
     const [listViewportHeight, setListViewportHeight] = useState(480)
     const sharedTabCounts = useContactTypeCountsStore(state => state.tabCounts)
     const syncContactTypeCounts = useContactTypeCountsStore(state => state.syncFromContacts)
+    const loadAttemptRef = useRef(0)
+    const loadTimeoutTimerRef = useRef<number | null>(null)
+    const [contactsLoadTimeoutMs, setContactsLoadTimeoutMs] = useState(DEFAULT_CONTACTS_LOAD_TIMEOUT_MS)
+    const [loadSession, setLoadSession] = useState<ContactsLoadSession | null>(null)
+    const [loadIssue, setLoadIssue] = useState<ContactsLoadIssue | null>(null)
+    const [showDiagnostics, setShowDiagnostics] = useState(false)
+    const [diagnosticTick, setDiagnosticTick] = useState(Date.now())
+    const [contactsDataSource, setContactsDataSource] = useState<ContactsDataSource>(null)
+    const [contactsUpdatedAt, setContactsUpdatedAt] = useState<number | null>(null)
+    const contactsLoadTimeoutMsRef = useRef(DEFAULT_CONTACTS_LOAD_TIMEOUT_MS)
+    const contactsCacheScopeRef = useRef('default')
+
+    const ensureContactsCacheScope = useCallback(async () => {
+        if (contactsCacheScopeRef.current !== 'default') {
+            return contactsCacheScopeRef.current
+        }
+        const [dbPath, myWxid] = await Promise.all([
+            configService.getDbPath(),
+            configService.getMyWxid()
+        ])
+        const scopeKey = dbPath || myWxid
+            ? `${dbPath || ''}::${myWxid || ''}`
+            : 'default'
+        contactsCacheScopeRef.current = scopeKey
+        return scopeKey
+    }, [])
+
+    useEffect(() => {
+        let cancelled = false
+        void (async () => {
+            try {
+                const value = await configService.getContactsLoadTimeoutMs()
+                if (!cancelled) {
+                    setContactsLoadTimeoutMs(value)
+                }
+            } catch (error) {
+                console.error('读取通讯录超时配置失败:', error)
+            }
+        })()
+        return () => {
+            cancelled = true
+        }
+    }, [])
+
+    useEffect(() => {
+        contactsLoadTimeoutMsRef.current = contactsLoadTimeoutMs
+    }, [contactsLoadTimeoutMs])
 
     const applyEnrichedContacts = useCallback((enrichedMap: Record<string, ContactEnrichInfo>) => {
         if (!enrichedMap || Object.keys(enrichedMap).length === 0) return
@@ -139,9 +207,40 @@ function ContactsPage() {
     }, [applyEnrichedContacts])
 
     // 加载通讯录
-    const loadContacts = useCallback(async () => {
+    const loadContacts = useCallback(async (options?: { scopeKey?: string }) => {
+        const scopeKey = options?.scopeKey || await ensureContactsCacheScope()
         const loadVersion = loadVersionRef.current + 1
         loadVersionRef.current = loadVersion
+        loadAttemptRef.current += 1
+        const startedAt = Date.now()
+        const timeoutMs = contactsLoadTimeoutMsRef.current
+        const requestId = `contacts-${startedAt}-${loadAttemptRef.current}`
+        setLoadSession({
+            requestId,
+            startedAt,
+            attempt: loadAttemptRef.current,
+            timeoutMs
+        })
+        setLoadIssue(null)
+        setShowDiagnostics(false)
+        if (loadTimeoutTimerRef.current) {
+            window.clearTimeout(loadTimeoutTimerRef.current)
+            loadTimeoutTimerRef.current = null
+        }
+        const timeoutTimerId = window.setTimeout(() => {
+            if (loadVersionRef.current !== loadVersion) return
+            const elapsedMs = Date.now() - startedAt
+            setLoadIssue({
+                kind: 'timeout',
+                title: '通讯录加载超时',
+                message: `等待超过 ${timeoutMs}ms，联系人列表仍未返回。`,
+                reason: 'chat.getContacts 长时间未返回，可能是数据库查询繁忙或连接异常。',
+                occurredAt: Date.now(),
+                elapsedMs
+            })
+        }, timeoutMs)
+        loadTimeoutTimerRef.current = timeoutTimerId
+
         setIsLoading(true)
         setAvatarEnrichProgress({
             loaded: 0,
@@ -153,6 +252,10 @@ function ContactsPage() {
 
             if (loadVersionRef.current !== loadVersion) return
             if (contactsResult.success && contactsResult.contacts) {
+                if (loadTimeoutTimerRef.current === timeoutTimerId) {
+                    window.clearTimeout(loadTimeoutTimerRef.current)
+                    loadTimeoutTimerRef.current = null
+                }
                 setContacts(contactsResult.contacts)
                 syncContactTypeCounts(contactsResult.contacts)
                 setSelectedUsernames(new Set())
@@ -160,28 +263,107 @@ function ContactsPage() {
                     if (!prev) return prev
                     return contactsResult.contacts!.find(contact => contact.username === prev.username) || null
                 })
+                const now = Date.now()
+                setContactsDataSource('network')
+                setContactsUpdatedAt(now)
+                setLoadIssue(null)
                 setIsLoading(false)
+                void configService.setContactsListCache(
+                    scopeKey,
+                    contactsResult.contacts.map(contact => ({
+                        username: contact.username,
+                        displayName: contact.displayName,
+                        remark: contact.remark,
+                        nickname: contact.nickname,
+                        type: contact.type
+                    }))
+                ).catch((error) => {
+                    console.error('写入通讯录缓存失败:', error)
+                })
                 void enrichContactsInBackground(contactsResult.contacts, loadVersion)
                 return
             }
+            const elapsedMs = Date.now() - startedAt
+            setLoadIssue({
+                kind: 'error',
+                title: '通讯录加载失败',
+                message: '联系人接口返回失败，未拿到联系人列表。',
+                reason: 'chat.getContacts 返回 success=false。',
+                errorDetail: contactsResult.error || '未知错误',
+                occurredAt: Date.now(),
+                elapsedMs
+            })
         } catch (e) {
             console.error('加载通讯录失败:', e)
+            const elapsedMs = Date.now() - startedAt
+            setLoadIssue({
+                kind: 'error',
+                title: '通讯录加载失败',
+                message: '联系人请求执行异常。',
+                reason: '调用 chat.getContacts 发生异常。',
+                errorDetail: String(e),
+                occurredAt: Date.now(),
+                elapsedMs
+            })
         } finally {
+            if (loadTimeoutTimerRef.current === timeoutTimerId) {
+                window.clearTimeout(loadTimeoutTimerRef.current)
+                loadTimeoutTimerRef.current = null
+            }
             if (loadVersionRef.current === loadVersion) {
                 setIsLoading(false)
             }
         }
-    }, [enrichContactsInBackground, syncContactTypeCounts])
+    }, [ensureContactsCacheScope, enrichContactsInBackground, syncContactTypeCounts])
 
     useEffect(() => {
-        loadContacts()
-    }, [loadContacts])
+        let cancelled = false
+        void (async () => {
+            const scopeKey = await ensureContactsCacheScope()
+            if (cancelled) return
+            try {
+                const cacheItem = await configService.getContactsListCache(scopeKey)
+                if (!cancelled && cacheItem && Array.isArray(cacheItem.contacts) && cacheItem.contacts.length > 0) {
+                    const cachedContacts: ContactInfo[] = cacheItem.contacts.map(contact => ({
+                        ...contact,
+                        avatarUrl: undefined
+                    }))
+                    setContacts(cachedContacts)
+                    syncContactTypeCounts(cachedContacts)
+                    setContactsDataSource('cache')
+                    setContactsUpdatedAt(cacheItem.updatedAt || null)
+                    setIsLoading(false)
+                }
+            } catch (error) {
+                console.error('读取通讯录缓存失败:', error)
+            }
+            if (!cancelled) {
+                void loadContacts({ scopeKey })
+            }
+        })()
+        return () => {
+            cancelled = true
+        }
+    }, [ensureContactsCacheScope, loadContacts, syncContactTypeCounts])
 
     useEffect(() => {
         return () => {
+            if (loadTimeoutTimerRef.current) {
+                window.clearTimeout(loadTimeoutTimerRef.current)
+                loadTimeoutTimerRef.current = null
+            }
             loadVersionRef.current += 1
         }
     }, [])
+
+    useEffect(() => {
+        if (!loadIssue || contacts.length > 0) return
+        if (!(isLoading && loadIssue.kind === 'timeout')) return
+        const timer = window.setInterval(() => {
+            setDiagnosticTick(Date.now())
+        }, 500)
+        return () => window.clearInterval(timer)
+    }, [contacts.length, isLoading, loadIssue])
 
     useEffect(() => {
         const timer = window.setTimeout(() => {
@@ -281,6 +463,45 @@ function ContactsPage() {
     const onContactsListScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
         setScrollTop(event.currentTarget.scrollTop)
     }, [])
+
+    const issueElapsedMs = useMemo(() => {
+        if (!loadIssue) return 0
+        if (isLoading && loadSession) {
+            return Math.max(loadIssue.elapsedMs, diagnosticTick - loadSession.startedAt)
+        }
+        return loadIssue.elapsedMs
+    }, [diagnosticTick, isLoading, loadIssue, loadSession])
+
+    const diagnosticsText = useMemo(() => {
+        if (!loadIssue || !loadSession) return ''
+        return [
+            `请求ID: ${loadSession.requestId}`,
+            `请求序号: 第 ${loadSession.attempt} 次`,
+            `阈值配置: ${loadSession.timeoutMs}ms`,
+            `当前状态: ${loadIssue.kind === 'timeout' ? '超时等待中' : '请求失败'}`,
+            `累计耗时: ${(issueElapsedMs / 1000).toFixed(1)}s`,
+            `发生时间: ${new Date(loadIssue.occurredAt).toLocaleString()}`,
+            `阶段: chat.getContacts`,
+            `原因: ${loadIssue.reason}`,
+            `错误详情: ${loadIssue.errorDetail || '无'}`
+        ].join('\n')
+    }, [issueElapsedMs, loadIssue, loadSession])
+
+    const copyDiagnostics = useCallback(async () => {
+        if (!diagnosticsText) return
+        try {
+            await navigator.clipboard.writeText(diagnosticsText)
+            alert('诊断信息已复制')
+        } catch (error) {
+            console.error('复制诊断信息失败:', error)
+            alert('复制失败，请手动复制诊断信息')
+        }
+    }, [diagnosticsText])
+
+    const contactsUpdatedAtLabel = useMemo(() => {
+        if (!contactsUpdatedAt) return ''
+        return new Date(contactsUpdatedAt).toLocaleString()
+    }, [contactsUpdatedAt])
 
     const toggleContactSelected = (username: string, checked: boolean) => {
         setSelectedUsernames(prev => {
@@ -410,7 +631,7 @@ function ContactsPage() {
                         >
                             <Download size={18} />
                         </button>
-                        <button className="icon-btn" onClick={loadContacts} disabled={isLoading}>
+                        <button className="icon-btn" onClick={() => void loadContacts()} disabled={isLoading}>
                             <RefreshCw size={18} className={isLoading ? 'spin' : ''} />
                         </button>
                     </div>
@@ -460,6 +681,14 @@ function ContactsPage() {
 
                 <div className="contacts-count">
                     共 {filteredContacts.length} / {contacts.length} 个联系人
+                    {contactsUpdatedAt && (
+                        <span className="contacts-cache-meta">
+                            {contactsDataSource === 'cache' ? '缓存' : '最新'} · 更新于 {contactsUpdatedAtLabel}
+                        </span>
+                    )}
+                    {isLoading && contacts.length > 0 && (
+                        <span className="contacts-cache-meta syncing">后台同步中...</span>
+                    )}
                     {avatarEnrichProgress.running && (
                         <span className="avatar-enrich-progress">
                             头像补全中 {avatarEnrichProgress.loaded}/{avatarEnrichProgress.total}
@@ -482,7 +711,39 @@ function ContactsPage() {
                     </div>
                 )}
 
-                {isLoading && contacts.length === 0 ? (
+                {contacts.length === 0 && loadIssue ? (
+                    <div className="load-issue-state">
+                        <div className="issue-card">
+                            <div className="issue-title">
+                                <AlertTriangle size={18} />
+                                <span>{loadIssue.title}</span>
+                            </div>
+                            <p className="issue-message">{loadIssue.message}</p>
+                            <p className="issue-reason">{loadIssue.reason}</p>
+                            <ul className="issue-hints">
+                                <li>可能原因1：数据库当前仍在执行高开销查询（例如导出页后台统计）。</li>
+                                <li>可能原因2：contact.db 数据量较大，首次查询时间过长。</li>
+                                <li>可能原因3：数据库连接状态异常或 IPC 调用卡住。</li>
+                            </ul>
+                            <div className="issue-actions">
+                                <button className="issue-btn primary" onClick={() => void loadContacts()}>
+                                    <RefreshCw size={14} />
+                                    <span>重试加载</span>
+                                </button>
+                                <button className="issue-btn" onClick={() => setShowDiagnostics(prev => !prev)}>
+                                    <ClipboardList size={14} />
+                                    <span>{showDiagnostics ? '收起诊断详情' : '查看诊断详情'}</span>
+                                </button>
+                                <button className="issue-btn" onClick={copyDiagnostics}>
+                                    <span>复制诊断信息</span>
+                                </button>
+                            </div>
+                            {showDiagnostics && (
+                                <pre className="issue-diagnostics">{diagnosticsText}</pre>
+                            )}
+                        </div>
+                    </div>
+                ) : isLoading && contacts.length === 0 ? (
                     <div className="loading-state">
                         <Loader2 size={32} className="spin" />
                         <span>联系人加载中...</span>

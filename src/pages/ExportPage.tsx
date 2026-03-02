@@ -222,6 +222,10 @@ const toKindByContactType = (session: AppChatSession, contact?: ContactInfo): Co
   return 'private'
 }
 
+const isContentScopeSession = (session: SessionRow): boolean => (
+  session.kind === 'private' || session.kind === 'group' || session.kind === 'former_friend'
+)
+
 const getAvatarLetter = (name: string): string => {
   if (!name) return '?'
   return [...name][0] || '?'
@@ -1327,11 +1331,11 @@ function ExportPage() {
 
   const openContentExport = (contentType: ContentType) => {
     const ids = sessions
-      .filter(session => session.kind === 'private' || session.kind === 'group')
+      .filter(isContentScopeSession)
       .map(session => session.username)
 
     const names = sessions
-      .filter(session => session.kind === 'private' || session.kind === 'group')
+      .filter(isContentScopeSession)
       .map(session => session.displayName || session.username)
 
     openExportDialog({
@@ -1375,8 +1379,8 @@ function ExportPage() {
   }, [tasks])
 
   const contentCards = useMemo(() => {
-    const scopeSessions = sessions.filter(session => session.kind === 'private' || session.kind === 'group')
-    const totalSessions = scopeSessions.length
+    const scopeSessions = sessions.filter(isContentScopeSession)
+    const totalSessions = tabCounts.private + tabCounts.group + tabCounts.former_friend
     const snsExportedCount = Math.min(lastSnsExportPostCount, snsStats.totalPosts)
 
     const sessionCards = [
@@ -1414,7 +1418,7 @@ function ExportPage() {
     }
 
     return [...sessionCards, snsCard]
-  }, [sessions, lastExportByContent, snsStats, lastSnsExportPostCount])
+  }, [sessions, tabCounts, lastExportByContent, snsStats, lastSnsExportPostCount])
 
   const activeTabLabel = useMemo(() => {
     if (activeTab === 'private') return '私聊'
@@ -1606,7 +1610,7 @@ function ExportPage() {
     ? formatOptions.filter(option => option.value === 'html' || option.value === 'json')
     : formatOptions
   const isTabCountComputing = isSharedTabCountsLoading && !isSharedTabCountsReady
-  const isSessionCardStatsLoading = isLoading || isBaseConfigLoading
+  const isSessionCardStatsLoading = isBaseConfigLoading || (isSharedTabCountsLoading && !isSharedTabCountsReady)
   const isSnsCardStatsLoading = !hasSeededSnsStats
   const taskRunningCount = tasks.filter(task => task.status === 'running').length
   const taskQueuedCount = tasks.filter(task => task.status === 'queued').length
