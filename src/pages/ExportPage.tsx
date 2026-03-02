@@ -262,6 +262,91 @@ const toContactMapFromCaches = (
   return map
 }
 
+const mergeAvatarCacheIntoContacts = (
+  sourceContacts: ContactInfo[],
+  avatarEntries: Record<string, configService.ContactsAvatarCacheEntry>
+): ContactInfo[] => {
+  if (!sourceContacts.length || Object.keys(avatarEntries).length === 0) {
+    return sourceContacts
+  }
+
+  let changed = false
+  const merged = sourceContacts.map((contact) => {
+    const cachedAvatar = avatarEntries[contact.username]?.avatarUrl
+    if (!cachedAvatar || contact.avatarUrl) {
+      return contact
+    }
+    changed = true
+    return {
+      ...contact,
+      avatarUrl: cachedAvatar
+    }
+  })
+
+  return changed ? merged : sourceContacts
+}
+
+const upsertAvatarCacheFromContacts = (
+  avatarEntries: Record<string, configService.ContactsAvatarCacheEntry>,
+  sourceContacts: ContactInfo[],
+  options?: { prune?: boolean; markCheckedUsernames?: string[]; now?: number }
+): {
+  avatarEntries: Record<string, configService.ContactsAvatarCacheEntry>
+  changed: boolean
+  updatedAt: number | null
+} => {
+  const nextCache = { ...avatarEntries }
+  const now = options?.now || Date.now()
+  const markCheckedSet = new Set((options?.markCheckedUsernames || []).filter(Boolean))
+  const usernamesInSource = new Set<string>()
+  let changed = false
+
+  for (const contact of sourceContacts) {
+    const username = String(contact.username || '').trim()
+    if (!username) continue
+    usernamesInSource.add(username)
+    const prev = nextCache[username]
+    const avatarUrl = String(contact.avatarUrl || '').trim()
+    if (!avatarUrl) continue
+    const updatedAt = !prev || prev.avatarUrl !== avatarUrl ? now : prev.updatedAt
+    const checkedAt = markCheckedSet.has(username) ? now : (prev?.checkedAt || now)
+    if (!prev || prev.avatarUrl !== avatarUrl || prev.updatedAt !== updatedAt || prev.checkedAt !== checkedAt) {
+      nextCache[username] = {
+        avatarUrl,
+        updatedAt,
+        checkedAt
+      }
+      changed = true
+    }
+  }
+
+  for (const username of markCheckedSet) {
+    const prev = nextCache[username]
+    if (!prev) continue
+    if (prev.checkedAt !== now) {
+      nextCache[username] = {
+        ...prev,
+        checkedAt: now
+      }
+      changed = true
+    }
+  }
+
+  if (options?.prune) {
+    for (const username of Object.keys(nextCache)) {
+      if (usernamesInSource.has(username)) continue
+      delete nextCache[username]
+      changed = true
+    }
+  }
+
+  return {
+    avatarEntries: nextCache,
+    changed,
+    updatedAt: changed ? now : null
+  }
+}
+
 const toSessionRowsWithContacts = (
   sessions: AppChatSession[],
   contactMap: Record<string, ContactInfo>
@@ -468,89 +553,14 @@ function ExportPage() {
     return scopeKey
   }, [])
 
-  const loadContactsCachesWithScopeFallback = useCallback(async (primaryScopeKey: string) => {
-    const [myWxid, dbPath] = await Promise.all([
-      configService.getMyWxid(),
-      configService.getDbPath()
+  const loadContactsCaches = useCallback(async (scopeKey: string) => {
+    const [contactsItem, avatarItem] = await Promise.all([
+      configService.getContactsListCache(scopeKey),
+      configService.getContactsAvatarCache(scopeKey)
     ])
-    const candidates = Array.from(new Set([
-      primaryScopeKey,
-      dbPath || '',
-      myWxid || '',
-      dbPath && myWxid ? `${dbPath}::${myWxid}` : '',
-      dbPath ? `${dbPath}::` : '',
-      myWxid ? `::${myWxid}` : '',
-      'default'
-    ].filter(Boolean)))
-
-    type CacheCandidate = {
-      scopeKey: string
-      contactsItem: configService.ContactsListCacheItem | null
-      avatarItem: configService.ContactsAvatarCacheItem | null
-      contactsCount: number
-      avatarCount: number
-      contactsUpdatedAt: number
-      avatarUpdatedAt: number
-    }
-
-    const candidatesWithData: CacheCandidate[] = []
-    for (const candidate of candidates) {
-      const [contactsItem, avatarItem] = await Promise.all([
-        configService.getContactsListCache(candidate),
-        configService.getContactsAvatarCache(candidate)
-      ])
-      const contactsCount = contactsItem?.contacts?.length || 0
-      const avatarCount = avatarItem ? Object.keys(avatarItem.avatars || {}).length : 0
-      if (contactsCount === 0 && avatarCount === 0) continue
-      candidatesWithData.push({
-        scopeKey: candidate,
-        contactsItem,
-        avatarItem,
-        contactsCount,
-        avatarCount,
-        contactsUpdatedAt: contactsItem?.updatedAt || 0,
-        avatarUpdatedAt: avatarItem?.updatedAt || 0
-      })
-    }
-
-    if (candidatesWithData.length === 0) {
-      return {
-        resolvedContactsScopeKey: primaryScopeKey,
-        resolvedAvatarScopeKeys: [] as string[],
-        contactsItem: null as configService.ContactsListCacheItem | null,
-        avatarItem: null as configService.ContactsAvatarCacheItem | null
-      }
-    }
-
-    const bestContactsCandidate = candidatesWithData
-      .filter(item => item.contactsCount > 0)
-      .sort((a, b) => {
-        if (b.contactsCount !== a.contactsCount) return b.contactsCount - a.contactsCount
-        if (b.contactsUpdatedAt !== a.contactsUpdatedAt) return b.contactsUpdatedAt - a.contactsUpdatedAt
-        return b.avatarCount - a.avatarCount
-      })[0]
-
-    const avatarCandidates = candidatesWithData
-      .filter(item => item.avatarCount > 0)
-      .sort((a, b) => a.avatarUpdatedAt - b.avatarUpdatedAt)
-    const mergedAvatarEntries: Record<string, configService.ContactsAvatarCacheEntry> = {}
-    for (const candidate of avatarCandidates) {
-      Object.assign(mergedAvatarEntries, candidate.avatarItem?.avatars || {})
-    }
-    const mergedAvatarUpdatedAt = avatarCandidates.reduce((max, candidate) => (
-      candidate.avatarUpdatedAt > max ? candidate.avatarUpdatedAt : max
-    ), 0)
-
     return {
-      resolvedContactsScopeKey: bestContactsCandidate?.scopeKey || primaryScopeKey,
-      resolvedAvatarScopeKeys: avatarCandidates.map(candidate => candidate.scopeKey),
-      contactsItem: bestContactsCandidate?.contactsItem || null,
-      avatarItem: Object.keys(mergedAvatarEntries).length > 0
-        ? {
-            updatedAt: mergedAvatarUpdatedAt,
-            avatars: mergedAvatarEntries
-          }
-        : null
+      contactsItem,
+      avatarItem
     }
   }, [])
 
@@ -700,11 +710,9 @@ function ExportPage() {
       if (isStale()) return
 
       const {
-        resolvedContactsScopeKey,
-        resolvedAvatarScopeKeys,
         contactsItem: cachedContactsItem,
         avatarItem: cachedAvatarItem
-      } = await loadContactsCachesWithScopeFallback(scopeKey)
+      } = await loadContactsCaches(scopeKey)
       if (isStale()) return
 
       const cachedContacts = cachedContactsItem?.contacts || []
@@ -718,17 +726,6 @@ function ExportPage() {
       }
       setSessionContactsUpdatedAt(cachedContactsItem?.updatedAt || null)
       setSessionAvatarUpdatedAt(cachedAvatarItem?.updatedAt || null)
-
-      if (resolvedContactsScopeKey !== scopeKey && cachedContacts.length > 0) {
-        void configService.setContactsListCache(scopeKey, cachedContacts).catch((error) => {
-          console.error('回填主 scope 通讯录缓存失败:', error)
-        })
-      }
-      if (!resolvedAvatarScopeKeys.includes(scopeKey) && Object.keys(cachedAvatarEntries).length > 0) {
-        void configService.setContactsAvatarCache(scopeKey, cachedAvatarEntries).catch((error) => {
-          console.error('回填主 scope 头像缓存失败:', error)
-        })
-      }
 
       const connectResult = await window.electronAPI.chat.connect()
       if (!connectResult.success) {
@@ -759,34 +756,71 @@ function ExportPage() {
             let contactMap = { ...cachedContactMap }
             let avatarEntries = { ...cachedAvatarEntries }
             let hasFreshNetworkData = false
+            let hasNetworkContactsSnapshot = false
 
             if (isStale()) return
             const contactsResult = await withTimeout(window.electronAPI.chat.getContacts(), CONTACT_ENRICH_TIMEOUT_MS)
             if (isStale()) return
 
-            const contacts: ContactInfo[] = contactsResult?.success && contactsResult.contacts ? contactsResult.contacts : []
-            if (contacts.length > 0) {
+            const contactsFromNetwork: ContactInfo[] = contactsResult?.success && contactsResult.contacts ? contactsResult.contacts : []
+            if (contactsFromNetwork.length > 0) {
               hasFreshNetworkData = true
-              syncContactTypeCounts(contacts)
-              const nextContactMap = contacts.reduce<Record<string, ContactInfo>>((map, contact) => {
+              hasNetworkContactsSnapshot = true
+              const contactsWithCachedAvatar = mergeAvatarCacheIntoContacts(contactsFromNetwork, avatarEntries)
+              const nextContactMap = contactsWithCachedAvatar.reduce<Record<string, ContactInfo>>((map, contact) => {
                 map[contact.username] = contact
                 return map
               }, {})
+              for (const [username, cachedContact] of Object.entries(cachedContactMap)) {
+                if (!nextContactMap[username]) {
+                  nextContactMap[username] = cachedContact
+                }
+              }
               contactMap = nextContactMap
-              setSessionContactsUpdatedAt(Date.now())
+              syncContactTypeCounts(Object.values(contactMap))
+              const refreshAt = Date.now()
+              setSessionContactsUpdatedAt(refreshAt)
+
+              const upsertResult = upsertAvatarCacheFromContacts(avatarEntries, Object.values(contactMap), {
+                prune: true,
+                now: refreshAt
+              })
+              avatarEntries = upsertResult.avatarEntries
+              if (upsertResult.updatedAt) {
+                setSessionAvatarUpdatedAt(upsertResult.updatedAt)
+              }
             }
 
+            const sourceContacts = Object.values(contactMap)
+            const sourceByUsername = new Map<string, ContactInfo>()
+            for (const contact of sourceContacts) {
+              if (!contact?.username) continue
+              sourceByUsername.set(contact.username, contact)
+            }
             const now = Date.now()
-            const needsEnrichment = baseSessions
-              .filter((session) => {
-                const contact = contactMap[session.username]
-                const avatarEntry = avatarEntries[session.username]
-                const displayName = contact?.displayName || session.displayName || session.username
-                const avatarUrl = contact?.avatarUrl || session.avatarUrl || avatarEntry?.avatarUrl
-                const shouldRecheckAvatar = !avatarEntry || (now - (avatarEntry.checkedAt || 0) >= EXPORT_AVATAR_RECHECK_INTERVAL_MS)
-                return !avatarUrl || displayName === session.username || shouldRecheckAvatar
+            const rawSessionMap = rawSessions.reduce<Record<string, AppChatSession>>((map, session) => {
+              map[session.username] = session
+              return map
+            }, {})
+            const candidateUsernames = sourceContacts.length > 0
+              ? sourceContacts.map(contact => contact.username)
+              : baseSessions.map(session => session.username)
+            const needsEnrichment = candidateUsernames
+              .filter(Boolean)
+              .filter((username) => {
+                const currentContact = sourceByUsername.get(username)
+                const cacheEntry = avatarEntries[username]
+                const session = rawSessionMap[username]
+                const currentAvatarUrl = currentContact?.avatarUrl || session?.avatarUrl
+                if (!cacheEntry || !cacheEntry.avatarUrl) {
+                  return !currentAvatarUrl
+                }
+                if (currentAvatarUrl && currentAvatarUrl !== cacheEntry.avatarUrl) {
+                  return true
+                }
+                const checkedAt = cacheEntry.checkedAt || 0
+                return now - checkedAt >= EXPORT_AVATAR_RECHECK_INTERVAL_MS
               })
-              .map((session) => session.username)
 
             let extraContactMap: Record<string, { displayName?: string; avatarUrl?: string }> = {}
             if (needsEnrichment.length > 0) {
@@ -806,62 +840,55 @@ function ExportPage() {
                       ...enrichResult.contacts
                     }
                     hasFreshNetworkData = true
+                    for (const [username, enriched] of Object.entries(enrichResult.contacts)) {
+                      const current = sourceByUsername.get(username)
+                      if (!current) continue
+                      sourceByUsername.set(username, {
+                        ...current,
+                        displayName: enriched.displayName || current.displayName,
+                        avatarUrl: enriched.avatarUrl || current.avatarUrl
+                      })
+                    }
                   }
                 } catch (batchError) {
                   console.error('导出页分批补充会话联系人信息失败:', batchError)
+                }
+
+                const batchContacts = batch
+                  .map(username => sourceByUsername.get(username))
+                  .filter((contact): contact is ContactInfo => Boolean(contact))
+                const upsertResult = upsertAvatarCacheFromContacts(avatarEntries, batchContacts, {
+                  markCheckedUsernames: batch
+                })
+                avatarEntries = upsertResult.avatarEntries
+                if (upsertResult.updatedAt) {
+                  setSessionAvatarUpdatedAt(upsertResult.updatedAt)
                 }
                 await new Promise(resolve => setTimeout(resolve, 0))
               }
             }
 
-            const persistAt = Date.now()
-            for (const contact of Object.values(contactMap)) {
-              const avatarUrl = String(contact.avatarUrl || '').trim()
-              if (!avatarUrl) continue
-              const prev = avatarEntries[contact.username]
-              avatarEntries[contact.username] = {
-                avatarUrl,
-                updatedAt: prev?.avatarUrl === avatarUrl ? prev.updatedAt : persistAt,
-                checkedAt: prev?.checkedAt || persistAt
+            const contactsForPersist = Array.from(sourceByUsername.values())
+            if (hasNetworkContactsSnapshot && contactsForPersist.length > 0) {
+              const upsertResult = upsertAvatarCacheFromContacts(avatarEntries, contactsForPersist, {
+                prune: true
+              })
+              avatarEntries = upsertResult.avatarEntries
+              if (upsertResult.updatedAt) {
+                setSessionAvatarUpdatedAt(upsertResult.updatedAt)
               }
             }
-
-            for (const username of needsEnrichment) {
-              const extra = extraContactMap[username]
-              const prev = avatarEntries[username]
-              if (extra?.avatarUrl) {
-                avatarEntries[username] = {
-                  avatarUrl: extra.avatarUrl,
-                  updatedAt: !prev || prev.avatarUrl !== extra.avatarUrl ? persistAt : prev.updatedAt,
-                  checkedAt: persistAt
-                }
-              } else if (prev) {
-                avatarEntries[username] = {
-                  ...prev,
-                  checkedAt: persistAt
-                }
-              }
-
-              if (!extra) continue
-              const current = contactMap[username]
-              if (!current) continue
-              const nextDisplayName = extra.displayName || current.displayName
-              const nextAvatarUrl = extra.avatarUrl || current.avatarUrl
-              if (nextDisplayName !== current.displayName || nextAvatarUrl !== current.avatarUrl) {
-                contactMap[username] = {
-                  ...current,
-                  displayName: nextDisplayName,
-                  avatarUrl: nextAvatarUrl
-                }
-              }
-            }
+            contactMap = contactsForPersist.reduce<Record<string, ContactInfo>>((map, contact) => {
+              map[contact.username] = contact
+              return map
+            }, contactMap)
 
             if (isStale()) return
             const nextSessions = toSessionRowsWithContacts(rawSessions, contactMap)
               .map((session) => {
                 const extra = extraContactMap[session.username]
                 const displayName = extra?.displayName || session.displayName || session.username
-                const avatarUrl = extra?.avatarUrl || session.avatarUrl
+                const avatarUrl = extra?.avatarUrl || session.avatarUrl || avatarEntries[session.username]?.avatarUrl
                 if (displayName === session.displayName && avatarUrl === session.avatarUrl) {
                   return session
                 }
@@ -881,8 +908,9 @@ function ExportPage() {
               type: contact.type
             }))
 
+            const persistAt = Date.now()
             setSessions(nextSessions)
-            if (contactsCachePayload.length > 0) {
+            if (hasNetworkContactsSnapshot && contactsCachePayload.length > 0) {
               await configService.setContactsListCache(scopeKey, contactsCachePayload)
               setSessionContactsUpdatedAt(persistAt)
             }
@@ -908,7 +936,7 @@ function ExportPage() {
     } finally {
       if (!isStale()) setIsLoading(false)
     }
-  }, [ensureExportCacheScope, loadContactsCachesWithScopeFallback, syncContactTypeCounts])
+  }, [ensureExportCacheScope, loadContactsCaches, syncContactTypeCounts])
 
   useEffect(() => {
     if (!isExportRoute) return
