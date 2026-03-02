@@ -2721,7 +2721,19 @@ function ExportPage() {
                 onClick={(event) => event.stopPropagation()}
               >
               <div className="detail-header">
-                <h4>会话详情</h4>
+                <div className="detail-header-main">
+                  <div className="detail-header-avatar">
+                    {sessionDetail?.avatarUrl ? (
+                      <img src={sessionDetail.avatarUrl} alt="" />
+                    ) : (
+                      <span>{getAvatarLetter(sessionDetail?.displayName || sessionDetail?.wxid || '')}</span>
+                    )}
+                  </div>
+                  <div className="detail-header-meta">
+                    <h4>{sessionDetail?.displayName || '会话详情'}</h4>
+                    <div className="detail-header-id">{sessionDetail?.wxid || ''}</div>
+                  </div>
+                </div>
                 <button className="close-btn" onClick={() => setShowSessionDetailPanel(false)}>
                   <X size={16} />
                 </button>

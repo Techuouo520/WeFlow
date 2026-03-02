@@ -1044,11 +1044,59 @@
     padding: 14px;
     border-bottom: 1px solid var(--border-color);
 
-    h4 {
-      margin: 0;
-      font-size: 15px;
-      font-weight: 600;
-      color: var(--text-primary);
+    .detail-header-main {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .detail-header-avatar {
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, var(--primary), var(--primary-hover));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      flex-shrink: 0;
+
+      img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+
+      span {
+        color: #fff;
+        font-size: 13px;
+        font-weight: 600;
+      }
+    }
+
+    .detail-header-meta {
+      min-width: 0;
+
+      h4 {
+        margin: 0;
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--text-primary);
+        line-height: 1.2;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+    }
+
+    .detail-header-id {
+      margin-top: 3px;
+      font-size: 11px;
+      color: var(--text-tertiary);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .close-btn {
