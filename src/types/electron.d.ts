@@ -1,5 +1,9 @@
 import type { ChatSession, Message, Contact, ContactInfo } from './models'
 
+export interface SessionChatWindowOpenOptions {
+  source?: 'chat' | 'export'
+}
+
 export interface ElectronAPI {
   window: {
     minimize: () => void
@@ -13,7 +17,7 @@ export interface ElectronAPI {
     resizeToFitVideo: (videoWidth: number, videoHeight: number) => Promise<void>
     openImageViewerWindow: (imagePath: string, liveVideoPath?: string) => Promise<void>
     openChatHistoryWindow: (sessionId: string, messageId: number) => Promise<boolean>
-    openSessionChatWindow: (sessionId: string) => Promise<boolean>
+    openSessionChatWindow: (sessionId: string, options?: SessionChatWindowOpenOptions) => Promise<boolean>
   }
   config: {
     get: (key: string) => Promise<unknown>
@@ -250,7 +254,13 @@ export interface ElectronAPI {
     }>
     getExportSessionStats: (
       sessionIds: string[],
-      options?: { includeRelations?: boolean; forceRefresh?: boolean; allowStaleCache?: boolean; preferAccurateSpecialTypes?: boolean }
+      options?: {
+        includeRelations?: boolean
+        forceRefresh?: boolean
+        allowStaleCache?: boolean
+        preferAccurateSpecialTypes?: boolean
+        cacheOnly?: boolean
+      }
     ) => Promise<{
       success: boolean
       data?: Record<string, {

@@ -204,6 +204,7 @@ function formatYmdHmDateTime(timestamp?: number): string {
 interface ChatPageProps {
   standaloneSessionWindow?: boolean
   initialSessionId?: string | null
+  standaloneSource?: string | null
 }
 
 
@@ -408,8 +409,10 @@ const SessionItem = React.memo(function SessionItem({
 
 
 function ChatPage(props: ChatPageProps) {
-  const { standaloneSessionWindow = false, initialSessionId = null } = props
+  const { standaloneSessionWindow = false, initialSessionId = null, standaloneSource = null } = props
   const normalizedInitialSessionId = useMemo(() => String(initialSessionId || '').trim(), [initialSessionId])
+  const normalizedStandaloneSource = useMemo(() => String(standaloneSource || '').trim().toLowerCase(), [standaloneSource])
+  const shouldHideStandaloneDetailButton = standaloneSessionWindow && normalizedStandaloneSource === 'export'
   const navigate = useNavigate()
 
   const {
@@ -3863,13 +3866,15 @@ function ChatPage(props: ChatPageProps) {
                 >
                   <RefreshCw size={18} className={isRefreshingMessages ? 'spin' : ''} />
                 </button>
-                <button
-                  className={`icon-btn detail-btn ${showDetailPanel ? 'active' : ''}`}
-                  onClick={toggleDetailPanel}
-                  title="会话详情"
-                >
-                  <Info size={18} />
-                </button>
+                {!shouldHideStandaloneDetailButton && (
+                  <button
+                    className={`icon-btn detail-btn ${showDetailPanel ? 'active' : ''}`}
+                    onClick={toggleDetailPanel}
+                    title="会话详情"
+                  >
+                    <Info size={18} />
+                  </button>
+                )}
               </div>
             </div>
 

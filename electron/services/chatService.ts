@@ -164,6 +164,7 @@ interface ExportSessionStatsOptions {
   forceRefresh?: boolean
   allowStaleCache?: boolean
   preferAccurateSpecialTypes?: boolean
+  cacheOnly?: boolean
 }
 
 interface ExportSessionStatsCacheMeta {
@@ -5354,6 +5355,7 @@ class ChatService {
       const forceRefresh = options.forceRefresh === true
       const allowStaleCache = options.allowStaleCache === true
       const preferAccurateSpecialTypes = options.preferAccurateSpecialTypes === true
+      const cacheOnly = options.cacheOnly === true
 
       const normalizedSessionIds = Array.from(
         new Set(
@@ -5377,31 +5379,33 @@ class ChatService {
           ? this.getGroupMyMessageCountHintEntry(sessionId)
           : null
         const cachedResult = this.getSessionStatsCacheEntry(sessionId)
-        if (!forceRefresh && !preferAccurateSpecialTypes) {
-          if (cachedResult && this.supportsRequestedRelation(cachedResult.entry, includeRelations)) {
-            const stale = now - cachedResult.entry.updatedAt > this.sessionStatsCacheTtlMs
-            if (!stale || allowStaleCache) {
-              resultMap[sessionId] = this.fromSessionStatsCacheStats(cachedResult.entry.stats)
-              if (groupMyMessagesHint && Number.isFinite(groupMyMessagesHint.entry.messageCount)) {
-                resultMap[sessionId].groupMyMessages = groupMyMessagesHint.entry.messageCount
-              }
-              cacheMeta[sessionId] = {
-                updatedAt: cachedResult.entry.updatedAt,
-                stale,
-                includeRelations: cachedResult.entry.includeRelations,
-                source: cachedResult.source
-              }
-              if (stale) {
-                needsRefreshSet.add(sessionId)
-              }
-              continue
+        const canUseCache = cacheOnly || (!forceRefresh && !preferAccurateSpecialTypes)
+        if (canUseCache && cachedResult && this.supportsRequestedRelation(cachedResult.entry, includeRelations)) {
+          const stale = now - cachedResult.entry.updatedAt > this.sessionStatsCacheTtlMs
+          if (!stale || allowStaleCache || cacheOnly) {
+            resultMap[sessionId] = this.fromSessionStatsCacheStats(cachedResult.entry.stats)
+            if (groupMyMessagesHint && Number.isFinite(groupMyMessagesHint.entry.messageCount)) {
+              resultMap[sessionId].groupMyMessages = groupMyMessagesHint.entry.messageCount
             }
-          }
-          // allowStaleCache 仅对“已有缓存”生效；无缓存会话仍需进入计算流程。
-          if (allowStaleCache && cachedResult) {
-            needsRefreshSet.add(sessionId)
+            cacheMeta[sessionId] = {
+              updatedAt: cachedResult.entry.updatedAt,
+              stale,
+              includeRelations: cachedResult.entry.includeRelations,
+              source: cachedResult.source
+            }
+            if (stale) {
+              needsRefreshSet.add(sessionId)
+            }
             continue
           }
+        }
+        // allowStaleCache/cacheOnly 仅对“已有缓存”生效；无缓存会话不会直接算重查询。
+        if (canUseCache && allowStaleCache && cachedResult) {
+          needsRefreshSet.add(sessionId)
+          continue
+        }
+        if (cacheOnly) {
+          continue
         }
         pendingSessionIds.push(sessionId)
       }

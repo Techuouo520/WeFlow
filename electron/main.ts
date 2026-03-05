@@ -87,6 +87,7 @@ let onboardingWindow: BrowserWindow | null = null
 // Splash 启动窗口
 let splashWindow: BrowserWindow | null = null
 const sessionChatWindows = new Map<string, BrowserWindow>()
+const sessionChatWindowSources = new Map<string, 'chat' | 'export'>()
 const keyService = new KeyService()
 
 let mainWindowReady = false
@@ -121,6 +122,32 @@ interface AnnualReportYearsTaskState {
   done: boolean
   snapshot: AnnualReportYearsProgressPayload
   updatedAt: number
+}
+
+interface OpenSessionChatWindowOptions {
+  source?: 'chat' | 'export'
+}
+
+const normalizeSessionChatWindowSource = (source: unknown): 'chat' | 'export' => {
+  return String(source || '').trim().toLowerCase() === 'export' ? 'export' : 'chat'
+}
+
+const loadSessionChatWindowContent = (
+  win: BrowserWindow,
+  sessionId: string,
+  source: 'chat' | 'export'
+) => {
+  const query = new URLSearchParams({
+    sessionId,
+    source
+  }).toString()
+  if (process.env.VITE_DEV_SERVER_URL) {
+    win.loadURL(`${process.env.VITE_DEV_SERVER_URL}#/chat-window?${query}`)
+    return
+  }
+  win.loadFile(join(__dirname, '../dist/index.html'), {
+    hash: `/chat-window?${query}`
+  })
 }
 
 const annualReportYearsLoadTasks = new Map<string, AnnualReportYearsTaskState>()
@@ -688,12 +715,18 @@ function createChatHistoryWindow(sessionId: string, messageId: number) {
 /**
  * 创建独立的会话聊天窗口（单会话，复用聊天页右侧消息区域）
  */
-function createSessionChatWindow(sessionId: string) {
+function createSessionChatWindow(sessionId: string, options?: OpenSessionChatWindowOptions) {
   const normalizedSessionId = String(sessionId || '').trim()
   if (!normalizedSessionId) return null
+  const normalizedSource = normalizeSessionChatWindowSource(options?.source)
 
   const existing = sessionChatWindows.get(normalizedSessionId)
   if (existing && !existing.isDestroyed()) {
+    const trackedSource = sessionChatWindowSources.get(normalizedSessionId) || 'chat'
+    if (trackedSource !== normalizedSource) {
+      loadSessionChatWindowContent(existing, normalizedSessionId, normalizedSource)
+      sessionChatWindowSources.set(normalizedSessionId, normalizedSource)
+    }
     if (existing.isMinimized()) {
       existing.restore()
     }
@@ -730,10 +763,9 @@ function createSessionChatWindow(sessionId: string) {
     autoHideMenuBar: true
   })
 
-  const sessionParam = `sessionId=${encodeURIComponent(normalizedSessionId)}`
-  if (process.env.VITE_DEV_SERVER_URL) {
-    win.loadURL(`${process.env.VITE_DEV_SERVER_URL}#/chat-window?${sessionParam}`)
+  loadSessionChatWindowContent(win, normalizedSessionId, normalizedSource)
 
+  if (process.env.VITE_DEV_SERVER_URL) {
     win.webContents.on('before-input-event', (event, input) => {
       if (input.key === 'F12' || (input.control && input.shift && input.key === 'I')) {
         if (win.webContents.isDevToolsOpened()) {
@@ -743,10 +775,6 @@ function createSessionChatWindow(sessionId: string) {
         }
         event.preventDefault()
       }
-    })
-  } else {
-    win.loadFile(join(__dirname, '../dist/index.html'), {
-      hash: `/chat-window?${sessionParam}`
     })
   }
 
@@ -759,10 +787,12 @@ function createSessionChatWindow(sessionId: string) {
     const tracked = sessionChatWindows.get(normalizedSessionId)
     if (tracked === win) {
       sessionChatWindows.delete(normalizedSessionId)
+      sessionChatWindowSources.delete(normalizedSessionId)
     }
   })
 
   sessionChatWindows.set(normalizedSessionId, win)
+  sessionChatWindowSources.set(normalizedSessionId, normalizedSource)
   return win
 }
 
@@ -1071,8 +1101,8 @@ function registerIpcHandlers() {
   })
 
   // 打开会话聊天窗口（同会话仅保留一个窗口并聚焦）
-  ipcMain.handle('window:openSessionChatWindow', (_, sessionId: string) => {
-    const win = createSessionChatWindow(sessionId)
+  ipcMain.handle('window:openSessionChatWindow', (_, sessionId: string, options?: OpenSessionChatWindowOptions) => {
+    const win = createSessionChatWindow(sessionId, options)
     return Boolean(win)
   })
 
@@ -1410,6 +1440,7 @@ function registerIpcHandlers() {
     forceRefresh?: boolean
     allowStaleCache?: boolean
     preferAccurateSpecialTypes?: boolean
+    cacheOnly?: boolean
   }) => {
     return chatService.getExportSessionStats(sessionIds, options)
   })

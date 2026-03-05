@@ -99,8 +99,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.invoke('window:openImageViewerWindow', imagePath, liveVideoPath),
     openChatHistoryWindow: (sessionId: string, messageId: number) =>
       ipcRenderer.invoke('window:openChatHistoryWindow', sessionId, messageId),
-    openSessionChatWindow: (sessionId: string) =>
-      ipcRenderer.invoke('window:openSessionChatWindow', sessionId)
+    openSessionChatWindow: (sessionId: string, options?: { source?: 'chat' | 'export' }) =>
+      ipcRenderer.invoke('window:openSessionChatWindow', sessionId, options)
   },
 
   // 数据库路径
@@ -174,7 +174,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getSessionDetailExtra: (sessionId: string) => ipcRenderer.invoke('chat:getSessionDetailExtra', sessionId),
     getExportSessionStats: (
       sessionIds: string[],
-      options?: { includeRelations?: boolean; forceRefresh?: boolean; allowStaleCache?: boolean; preferAccurateSpecialTypes?: boolean }
+      options?: {
+        includeRelations?: boolean
+        forceRefresh?: boolean
+        allowStaleCache?: boolean
+        preferAccurateSpecialTypes?: boolean
+        cacheOnly?: boolean
+      }
     ) => ipcRenderer.invoke('chat:getExportSessionStats', sessionIds, options),
     getGroupMyMessageCountHint: (chatroomId: string) =>
       ipcRenderer.invoke('chat:getGroupMyMessageCountHint', chatroomId),

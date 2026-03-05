@@ -163,6 +163,7 @@ interface TimeRangeDialogDraft {
 }
 
 const defaultTxtColumns = ['index', 'time', 'senderRole', 'messageType', 'content']
+const DETAIL_PRECISE_REFRESH_COOLDOWN_MS = 10 * 60 * 1000
 const contentTypeLabels: Record<ContentType, string> = {
   text: '聊天文本',
   voice: '语音',
@@ -1307,6 +1308,8 @@ function ExportPage() {
   const hasBaseConfigReadyRef = useRef(false)
   const sessionCountRequestIdRef = useRef(0)
   const activeTabRef = useRef<ConversationTab>('private')
+  const detailStatsPriorityRef = useRef(false)
+  const sessionPreciseRefreshAtRef = useRef<Record<string, number>>({})
 
   const ensureExportCacheScope = useCallback(async (): Promise<string> => {
     if (exportCacheScopeReadyRef.current) {
@@ -1894,6 +1897,9 @@ function ExportPage() {
 
     setIsLoadingSessionCounts(true)
     try {
+      if (detailStatsPriorityRef.current) {
+        return { ...accumulatedCounts }
+      }
       if (prioritizedSessionIds.length > 0) {
         const priorityResult = await window.electronAPI.chat.getSessionMessageCounts(prioritizedSessionIds)
         if (isStale()) return { ...accumulatedCounts }
@@ -1902,6 +1908,9 @@ function ExportPage() {
         }
       }
 
+      if (detailStatsPriorityRef.current) {
+        return { ...accumulatedCounts }
+      }
       if (remainingSessionIds.length > 0) {
         const remainingResult = await window.electronAPI.chat.getSessionMessageCounts(remainingSessionIds)
         if (isStale()) return { ...accumulatedCounts }
@@ -1930,6 +1939,7 @@ function ExportPage() {
     const loadToken = Date.now()
     sessionLoadTokenRef.current = loadToken
     sessionsHydratedAtRef.current = 0
+    sessionPreciseRefreshAtRef.current = {}
     setIsLoading(true)
     setIsSessionEnriching(false)
     sessionCountRequestIdRef.current += 1
@@ -2027,12 +2037,14 @@ function ExportPage() {
         setIsSessionEnriching(true)
         void (async () => {
           try {
+            if (detailStatsPriorityRef.current) return
             let contactMap = { ...cachedContactMap }
             let avatarEntries = { ...cachedAvatarEntries }
             let hasFreshNetworkData = false
             let hasNetworkContactsSnapshot = false
 
             if (isStale()) return
+            if (detailStatsPriorityRef.current) return
             const contactsResult = await withTimeout(window.electronAPI.chat.getContacts(), CONTACT_ENRICH_TIMEOUT_MS)
             if (isStale()) return
 
@@ -2091,6 +2103,7 @@ function ExportPage() {
             if (needsEnrichment.length > 0) {
               for (let i = 0; i < needsEnrichment.length; i += EXPORT_AVATAR_ENRICH_BATCH_SIZE) {
                 if (isStale()) return
+                if (detailStatsPriorityRef.current) return
                 const batch = needsEnrichment.slice(i, i + EXPORT_AVATAR_ENRICH_BATCH_SIZE)
                 if (batch.length === 0) continue
                 try {
@@ -3399,6 +3412,11 @@ function ExportPage() {
   const loadSessionDetail = useCallback(async (sessionId: string) => {
     const normalizedSessionId = String(sessionId || '').trim()
     if (!normalizedSessionId) return
+    const preciseCacheKey = `${exportCacheScopeRef.current}::${normalizedSessionId}`
+
+    detailStatsPriorityRef.current = true
+    sessionCountRequestIdRef.current += 1
+    setIsLoadingSessionCounts(false)
 
     const requestSeq = ++detailRequestSeqRef.current
     const mappedSession = sessionRowByUsername.get(normalizedSessionId)
@@ -3510,19 +3528,13 @@ function ExportPage() {
     }
 
     try {
-      const [extraResultSettled, statsResultSettled] = await Promise.allSettled([
-        window.electronAPI.chat.getSessionDetailExtra(normalizedSessionId),
-        window.electronAPI.chat.getExportSessionStats(
-          [normalizedSessionId],
-          { includeRelations: false, allowStaleCache: true }
-        )
-      ])
-
-      if (requestSeq !== detailRequestSeqRef.current) return
-
-      if (extraResultSettled.status === 'fulfilled' && extraResultSettled.value.success) {
-        const detail = extraResultSettled.value.detail
-        if (detail) {
+      const extraPromise = window.electronAPI.chat.getSessionDetailExtra(normalizedSessionId)
+      void (async () => {
+        try {
+          const extraResult = await extraPromise
+          if (requestSeq !== detailRequestSeqRef.current) return
+          if (!extraResult.success || !extraResult.detail) return
+          const detail = extraResult.detail
           setSessionDetail((prev) => {
             if (!prev || prev.wxid !== normalizedSessionId) return prev
             return {
@@ -3532,62 +3544,86 @@ function ExportPage() {
               messageTables: Array.isArray(detail.messageTables) ? detail.messageTables : []
             }
           })
-        }
-      }
-
-      if (statsResultSettled.status === 'fulfilled' && statsResultSettled.value.success) {
-        const metric = statsResultSettled.value.data?.[normalizedSessionId] as SessionExportMetric | undefined
-        const cacheMeta = statsResultSettled.value.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
-        if (metric) {
-          applySessionDetailStats(normalizedSessionId, metric, cacheMeta, false)
-        } else if (cacheMeta) {
-          setSessionDetail((prev) => {
-            if (!prev || prev.wxid !== normalizedSessionId) return prev
-            return {
-              ...prev,
-              statsUpdatedAt: cacheMeta.updatedAt,
-              statsStale: cacheMeta.stale
-            }
-          })
-        }
-      }
-
-      setIsRefreshingSessionDetailStats(true)
-      void (async () => {
-        try {
-          // 后台精确补算三类重字段（转账/红包/通话），不阻塞首屏基础统计显示。
-          const freshResult = await window.electronAPI.chat.getExportSessionStats(
-            [normalizedSessionId],
-            { includeRelations: false, forceRefresh: true, preferAccurateSpecialTypes: true }
-          )
-          if (requestSeq !== detailRequestSeqRef.current) return
-          if (freshResult.success && freshResult.data) {
-            const metric = freshResult.data[normalizedSessionId] as SessionExportMetric | undefined
-            const cacheMeta = freshResult.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
-            if (metric) {
-              applySessionDetailStats(normalizedSessionId, metric, cacheMeta, false)
-            } else if (cacheMeta) {
-              setSessionDetail((prev) => {
-                if (!prev || prev.wxid !== normalizedSessionId) return prev
-                return {
-                  ...prev,
-                  statsUpdatedAt: cacheMeta.updatedAt,
-                  statsStale: cacheMeta.stale
-                }
-              })
-            }
-          }
         } catch (error) {
-          console.error('导出页刷新会话统计失败:', error)
+          console.error('导出页加载会话详情补充信息失败:', error)
         } finally {
           if (requestSeq === detailRequestSeqRef.current) {
-            setIsRefreshingSessionDetailStats(false)
+            setIsLoadingSessionDetailExtra(false)
           }
         }
       })()
+
+      let quickMetric: SessionExportMetric | undefined
+      let quickCacheMeta: SessionExportCacheMeta | undefined
+      try {
+        const quickStatsResult = await window.electronAPI.chat.getExportSessionStats(
+          [normalizedSessionId],
+          { includeRelations: false, allowStaleCache: true, cacheOnly: true }
+        )
+        if (requestSeq !== detailRequestSeqRef.current) return
+        if (quickStatsResult.success) {
+          quickMetric = quickStatsResult.data?.[normalizedSessionId] as SessionExportMetric | undefined
+          quickCacheMeta = quickStatsResult.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
+          if (quickMetric) {
+            applySessionDetailStats(normalizedSessionId, quickMetric, quickCacheMeta, false)
+          } else if (quickCacheMeta) {
+            const cacheMeta = quickCacheMeta
+            setSessionDetail((prev) => {
+              if (!prev || prev.wxid !== normalizedSessionId) return prev
+              return {
+                ...prev,
+                statsUpdatedAt: cacheMeta.updatedAt,
+                statsStale: cacheMeta.stale
+              }
+            })
+          }
+        }
+      } catch (error) {
+        console.error('导出页读取会话统计缓存失败:', error)
+      }
+
+      const lastPreciseAt = sessionPreciseRefreshAtRef.current[preciseCacheKey] || 0
+      const hasRecentPrecise = Date.now() - lastPreciseAt <= DETAIL_PRECISE_REFRESH_COOLDOWN_MS
+      const shouldRunPreciseRefresh = !hasRecentPrecise && (!quickMetric || Boolean(quickCacheMeta?.stale))
+
+      if (shouldRunPreciseRefresh) {
+        setIsRefreshingSessionDetailStats(true)
+        void (async () => {
+          try {
+            // 后台精确补算三类重字段（转账/红包/通话），不阻塞首屏基础统计显示。
+            const freshResult = await window.electronAPI.chat.getExportSessionStats(
+              [normalizedSessionId],
+              { includeRelations: false, forceRefresh: true, preferAccurateSpecialTypes: true }
+            )
+            if (requestSeq !== detailRequestSeqRef.current) return
+            if (freshResult.success && freshResult.data) {
+              const metric = freshResult.data[normalizedSessionId] as SessionExportMetric | undefined
+              const cacheMeta = freshResult.cache?.[normalizedSessionId] as SessionExportCacheMeta | undefined
+              if (metric) {
+                applySessionDetailStats(normalizedSessionId, metric, cacheMeta, false)
+                sessionPreciseRefreshAtRef.current[preciseCacheKey] = Date.now()
+              } else if (cacheMeta) {
+                setSessionDetail((prev) => {
+                  if (!prev || prev.wxid !== normalizedSessionId) return prev
+                  return {
+                    ...prev,
+                    statsUpdatedAt: cacheMeta.updatedAt,
+                    statsStale: cacheMeta.stale
+                  }
+                })
+              }
+            }
+          } catch (error) {
+            console.error('导出页刷新会话统计失败:', error)
+          } finally {
+            if (requestSeq === detailRequestSeqRef.current) {
+              setIsRefreshingSessionDetailStats(false)
+            }
+          }
+        })()
+      }
     } catch (error) {
       console.error('导出页加载会话详情补充统计失败:', error)
-    } finally {
       if (requestSeq === detailRequestSeqRef.current) {
         setIsLoadingSessionDetailExtra(false)
       }
@@ -3627,6 +3663,7 @@ function ExportPage() {
 
   const closeSessionDetailPanel = useCallback(() => {
     detailRequestSeqRef.current += 1
+    detailStatsPriorityRef.current = false
     setShowSessionDetailPanel(false)
     setIsLoadingSessionDetail(false)
     setIsLoadingSessionDetailExtra(false)
@@ -3636,6 +3673,7 @@ function ExportPage() {
 
   const openSessionDetail = useCallback((sessionId: string) => {
     if (!sessionId) return
+    detailStatsPriorityRef.current = true
     setShowSessionDetailPanel(true)
     void loadSessionDetail(sessionId)
   }, [loadSessionDetail])
@@ -3827,7 +3865,7 @@ function ExportPage() {
                 title={canExport ? '在新窗口打开该会话' : '该联系人暂无会话记录'}
                 onClick={() => {
                   if (!canExport) return
-                  void window.electronAPI.window.openSessionChatWindow(contact.username)
+                  void window.electronAPI.window.openSessionChatWindow(contact.username, { source: 'export' })
                 }}
               >
                 <ExternalLink size={13} />
