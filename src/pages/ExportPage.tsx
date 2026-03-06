@@ -489,6 +489,16 @@ const getAvatarLetter = (name: string): string => {
   return [...name][0] || '?'
 }
 
+const toComparableNameSet = (values: Array<string | undefined | null>): Set<string> => {
+  const set = new Set<string>()
+  for (const value of values) {
+    const normalized = String(value || '').trim()
+    if (!normalized) continue
+    set.add(normalized)
+  }
+  return set
+}
+
 const matchesContactTab = (contact: ContactInfo, tab: ConversationTab): boolean => {
   if (tab === 'private') return contact.type === 'friend'
   if (tab === 'group') return contact.type === 'group'
@@ -564,7 +574,7 @@ interface SessionSnsRankItem {
   latestTime: number
 }
 
-type SessionMutualFriendSource = 'likes' | 'comments' | 'both'
+type SessionMutualFriendSource = 'likes' | 'comments' | 'both' | 'reverse'
 
 interface SessionMutualFriendItem {
   name: string
@@ -703,6 +713,7 @@ const buildSessionMutualFriendsMetric = (
 
 const getSessionMutualFriendSourceLabel = (source: SessionMutualFriendSource): string => {
   if (source === 'both') return '点赞/评论'
+  if (source === 'reverse') return '反向关联'
   if (source === 'likes') return '仅点赞'
   return '仅评论'
 }
@@ -1496,6 +1507,7 @@ function ExportPage() {
     endIndex: -1
   })
   const sessionMutualFriendsMetricsRef = useRef<Record<string, SessionMutualFriendsMetric>>({})
+  const sessionMutualFriendsDirectMetricsRef = useRef<Record<string, SessionMutualFriendsMetric>>({})
   const sessionMutualFriendsQueueRef = useRef<string[]>([])
   const sessionMutualFriendsQueuedSetRef = useRef<Set<string>>(new Set())
   const sessionMutualFriendsLoadingSetRef = useRef<Set<string>>(new Set())
@@ -2636,6 +2648,7 @@ function ExportPage() {
 
   const resetSessionMutualFriendsLoader = useCallback(() => {
     sessionMutualFriendsRunIdRef.current += 1
+    sessionMutualFriendsDirectMetricsRef.current = {}
     sessionMutualFriendsQueueRef.current = []
     sessionMutualFriendsQueuedSetRef.current.clear()
     sessionMutualFriendsLoadingSetRef.current.clear()
@@ -2688,6 +2701,109 @@ function ExportPage() {
     snsUserPostCountsStatus === 'loading' ||
     snsUserPostCountsStatus === 'idle'
   ), [snsUserPostCountsStatus])
+
+  const getSessionMutualFriendProfile = useCallback((sessionId: string): {
+    displayName: string
+    candidateNames: Set<string>
+  } => {
+    const normalizedSessionId = String(sessionId || '').trim()
+    const contact = contactsList.find(item => item.username === normalizedSessionId)
+    const session = sessionsRef.current.find(item => item.username === normalizedSessionId)
+    const displayName = contact?.displayName || contact?.remark || contact?.nickname || session?.displayName || normalizedSessionId
+    return {
+      displayName,
+      candidateNames: toComparableNameSet([
+        displayName,
+        contact?.displayName,
+        contact?.remark,
+        contact?.nickname,
+        contact?.alias
+      ])
+    }
+  }, [contactsList])
+
+  const rebuildSessionMutualFriendsMetric = useCallback((targetSessionId: string): SessionMutualFriendsMetric | null => {
+    const normalizedTargetSessionId = String(targetSessionId || '').trim()
+    if (!normalizedTargetSessionId) return null
+
+    const directMetrics = sessionMutualFriendsDirectMetricsRef.current
+    const directMetric = directMetrics[normalizedTargetSessionId]
+    if (!directMetric) return null
+
+    const { candidateNames } = getSessionMutualFriendProfile(normalizedTargetSessionId)
+    const mergedMap = new Map<string, SessionMutualFriendItem>()
+    for (const item of directMetric.items) {
+      mergedMap.set(item.name, { ...item })
+    }
+
+    for (const [sourceSessionId, sourceMetric] of Object.entries(directMetrics)) {
+      if (!sourceMetric || sourceSessionId === normalizedTargetSessionId) continue
+      const sourceProfile = getSessionMutualFriendProfile(sourceSessionId)
+      if (!sourceProfile.displayName) continue
+      if (mergedMap.has(sourceProfile.displayName)) continue
+
+      const reverseMatches = sourceMetric.items.filter(item => candidateNames.has(item.name))
+      if (reverseMatches.length === 0) continue
+
+      const reverseCount = reverseMatches.reduce((sum, item) => sum + item.totalCount, 0)
+      const reverseLatestTime = reverseMatches.reduce((latest, item) => Math.max(latest, item.latestTime), 0)
+      mergedMap.set(sourceProfile.displayName, {
+        name: sourceProfile.displayName,
+        likeCount: 0,
+        commentCount: 0,
+        totalCount: reverseCount,
+        latestTime: reverseLatestTime,
+        source: 'reverse'
+      })
+    }
+
+    const items = [...mergedMap.values()].sort((a, b) => {
+      if (b.totalCount !== a.totalCount) return b.totalCount - a.totalCount
+      if (b.latestTime !== a.latestTime) return b.latestTime - a.latestTime
+      return a.name.localeCompare(b.name, 'zh-CN')
+    })
+
+    return {
+      ...directMetric,
+      count: items.length,
+      items
+    }
+  }, [getSessionMutualFriendProfile])
+
+  const applySessionMutualFriendsMetric = useCallback((sessionId: string, directMetric: SessionMutualFriendsMetric) => {
+    const normalizedSessionId = String(sessionId || '').trim()
+    if (!normalizedSessionId) return
+    sessionMutualFriendsDirectMetricsRef.current[normalizedSessionId] = directMetric
+
+    const impactedSessionIds = new Set<string>([normalizedSessionId])
+    const allSessionIds = sessionsRef.current
+      .filter(session => session.hasSession && isSingleContactSession(session.username))
+      .map(session => session.username)
+
+    for (const targetSessionId of allSessionIds) {
+      if (targetSessionId === normalizedSessionId) continue
+      const targetProfile = getSessionMutualFriendProfile(targetSessionId)
+      if (directMetric.items.some(item => targetProfile.candidateNames.has(item.name))) {
+        impactedSessionIds.add(targetSessionId)
+      }
+    }
+
+    setSessionMutualFriendsMetrics(prev => {
+      const next = { ...prev }
+      let changed = false
+      for (const targetSessionId of impactedSessionIds) {
+        const rebuiltMetric = rebuildSessionMutualFriendsMetric(targetSessionId)
+        if (!rebuiltMetric) continue
+        const previousMetric = prev[targetSessionId]
+        const previousSerialized = previousMetric ? JSON.stringify(previousMetric) : ''
+        const nextSerialized = JSON.stringify(rebuiltMetric)
+        if (previousSerialized === nextSerialized) continue
+        next[targetSessionId] = rebuiltMetric
+        changed = true
+      }
+      return changed ? next : prev
+    })
+  }, [getSessionMutualFriendProfile, rebuildSessionMutualFriendsMetric])
 
   const isSessionMediaMetricReady = useCallback((sessionId: string): boolean => {
     if (!sessionId) return true
@@ -2892,10 +3008,7 @@ function ExportPage() {
         try {
           const metric = await loadSessionMutualFriendsMetric(sessionId)
           if (runId !== sessionMutualFriendsRunIdRef.current) return
-          setSessionMutualFriendsMetrics(prev => ({
-            ...prev,
-            [sessionId]: metric
-          }))
+          applySessionMutualFriendsMetric(sessionId, metric)
           sessionMutualFriendsReadySetRef.current.add(sessionId)
           patchSessionLoadTraceStage([sessionId], 'mutualFriends', 'done')
         } catch (error) {
@@ -2916,6 +3029,7 @@ function ExportPage() {
       }
     }
   }, [
+    applySessionMutualFriendsMetric,
     hasPendingMetricLoads,
     isSessionMutualFriendsReady,
     loadSessionMutualFriendsMetric,
