@@ -261,20 +261,47 @@ class GroupAnalyticsService {
    * 从 DLL 获取群成员的群昵称
    */
   private async getGroupNicknamesForRoom(chatroomId: string, candidates: string[] = []): Promise<Map<string, string>> {
+    const nicknameMap = new Map<string, string>()
+
     try {
-      const escapedChatroomId = chatroomId.replace(/'/g, "''")
-      const sql = `SELECT ext_buffer FROM chat_room WHERE username='${escapedChatroomId}' LIMIT 1`
-      const result = await wcdbService.execQuery('contact', null, sql)
+      const dllResult = await wcdbService.getGroupNicknames(chatroomId)
+      if (dllResult.success && dllResult.nicknames) {
+        this.mergeGroupNicknameEntries(nicknameMap, Object.entries(dllResult.nicknames))
+      }
+    } catch (e) {
+      console.error('getGroupNicknamesForRoom dll error:', e)
+    }
+
+    try {
+      const sql = 'SELECT ext_buffer FROM chat_room WHERE username = ? LIMIT 1'
+      const result = await wcdbService.execQuery('contact', null, sql, [chatroomId])
       if (!result.success || !result.rows || result.rows.length === 0) {
-        return new Map<string, string>()
+        return nicknameMap
       }
 
       const extBuffer = this.decodeExtBuffer((result.rows[0] as any).ext_buffer)
-      if (!extBuffer) return new Map<string, string>()
-      return this.parseGroupNicknamesFromExtBuffer(extBuffer, candidates)
+      if (!extBuffer) return nicknameMap
+      this.mergeGroupNicknameEntries(nicknameMap, this.parseGroupNicknamesFromExtBuffer(extBuffer, candidates).entries())
+      return nicknameMap
     } catch (e) {
       console.error('getGroupNicknamesForRoom error:', e)
-      return new Map<string, string>()
+      return nicknameMap
+    }
+  }
+
+  private mergeGroupNicknameEntries(
+    target: Map<string, string>,
+    entries: Iterable<[string, string]>
+  ): void {
+    for (const [memberIdRaw, nicknameRaw] of entries) {
+      const nickname = this.normalizeGroupNickname(nicknameRaw || '')
+      if (!nickname) continue
+      for (const alias of this.buildIdCandidates([memberIdRaw])) {
+        if (!alias) continue
+        if (!target.has(alias)) target.set(alias, nickname)
+        const lower = alias.toLowerCase()
+        if (!target.has(lower)) target.set(lower, nickname)
+      }
     }
   }
 
