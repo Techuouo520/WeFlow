@@ -30,14 +30,17 @@ export class KeyServiceLinux {
     throw new Error('找不到 xkey_helper_linux，请检查路径')
   }
 
-  public async autoGetDbKey(): Promise<DbKeyResult> {
+  public async autoGetDbKey(
+      timeoutMs = 60_000,
+      onStatus?: (message: string, level: number) => void
+  ): Promise<DbKeyResult> {
     try {
-      console.log('[Linux KeyService] 1. 尝试结束当前微信进程...')
+      onStatus?.('正在尝试结束当前微信进程...', 0)
       await execAsync('killall -9 wechat wechat-bin xwechat').catch(() => {})
       // 稍微等待进程完全退出
       await new Promise(r => setTimeout(r, 1000))
 
-      console.log('[Linux KeyService] 2. 尝试拉起微信...')
+      onStatus?.('正在尝试拉起微信...', 0)
       const startCmds = [
         'nohup wechat >/dev/null 2>&1 &',
         'nohup wechat-bin >/dev/null 2>&1 &',
@@ -45,7 +48,7 @@ export class KeyServiceLinux {
       ]
       for (const cmd of startCmds) execAsync(cmd).catch(() => {})
 
-      console.log('[Linux KeyService] 3. 等待微信进程出现...')
+      onStatus?.('等待微信进程出现...', 0)
       let pid = 0
       for (let i = 0; i < 15; i++) { // 最多等 15 秒
         await new Promise(r => setTimeout(r, 1000))
@@ -58,29 +61,39 @@ export class KeyServiceLinux {
       }
 
       if (!pid) {
-        return { success: false, error: '未能自动启动微信，请手动启动并登录。' }
+        const err = '未能自动启动微信，请手动启动并登录。'
+        onStatus?.(err, 2)
+        return { success: false, error: err }
       }
 
-      console.log(`[Linux KeyService] 4. 捕获到微信 PID: ${pid}，准备获取密钥...`)
+      onStatus?.(`捕获到微信 PID: ${pid}，准备获取密钥...`, 0)
 
       await new Promise(r => setTimeout(r, 2000))
 
-      return await this.getDbKey(pid)
+      return await this.getDbKey(pid, onStatus)
     } catch (err: any) {
-      return { success: false, error: '自动获取微信 PID 失败: ' + err.message }
+      const errMsg = '自动获取微信 PID 失败: ' + err.message
+      onStatus?.(errMsg, 2)
+      return { success: false, error: errMsg }
     }
   }
 
-  public async getDbKey(pid: number): Promise<DbKeyResult> {
+  public async getDbKey(pid: number, onStatus?: (message: string, level: number) => void): Promise<DbKeyResult> {
     try {
       const helperPath = this.getHelperPath()
+
+      onStatus?.('正在扫描数据库基址...', 0)
       const { stdout: scanOut } = await execFileAsync(helperPath, ['db_scan', pid.toString()])
       const scanRes = JSON.parse(scanOut.trim())
 
       if (!scanRes.success) {
-        return { success: false, error: scanRes.result || '扫描失败，请确保微信已完全登录' }
+        const err = scanRes.result || '扫描失败，请确保微信已完全登录'
+        onStatus?.(err, 2)
+        return { success: false, error: err }
       }
+
       const targetAddr = scanRes.target_addr
+      onStatus?.('基址扫描成功，正在请求管理员权限进行内存 Hook...', 0)
 
       return await new Promise((resolve) => {
         const options = { name: 'WeFlow' }
@@ -89,22 +102,27 @@ export class KeyServiceLinux {
         sudo.exec(command, options, (error, stdout) => {
           execAsync(`kill -CONT ${pid}`).catch(() => {})
           if (error) {
+            onStatus?.('授权失败或被取消', 2)
             resolve({ success: false, error: `授权失败或被取消: ${error.message}` })
             return
           }
           try {
             const hookRes = JSON.parse((stdout as string).trim())
             if (hookRes.success) {
+              onStatus?.('密钥获取成功', 1)
               resolve({ success: true, key: hookRes.key })
             } else {
+              onStatus?.(hookRes.result, 2)
               resolve({ success: false, error: hookRes.result })
             }
           } catch (e) {
+            onStatus?.('解析 Hook 结果失败', 2)
             resolve({ success: false, error: '解析 Hook 结果失败' })
           }
         })
       })
     } catch (err: any) {
+      onStatus?.(err.message, 2)
       return { success: false, error: err.message }
     }
   }
@@ -115,7 +133,7 @@ export class KeyServiceLinux {
       wxid?: string
   ): Promise<ImageKeyResult> {
     try {
-      if (onProgress) onProgress('正在初始化...');
+      onProgress?.('正在初始化缓存扫描...');
       const helperPath = this.getHelperPath()
       const { stdout } = await execFileAsync(helperPath, ['image_local'])
       const res = JSON.parse(stdout.trim())
@@ -126,7 +144,7 @@ export class KeyServiceLinux {
       if (!account && accounts.length > 0) account = accounts[0]
 
       if (account && account.keys && account.keys.length > 0) {
-        if (onProgress) onProgress('已找到匹配的图片密钥');
+        onProgress?.(`已找到匹配的图片密钥 (wxid: ${account.wxid})`);
         const keyObj = account.keys[0]
         return { success: true, xorKey: keyObj.xorKey, aesKey: keyObj.aesKey }
       }
@@ -141,54 +159,124 @@ export class KeyServiceLinux {
       onProgress?: (msg: string) => void
   ): Promise<ImageKeyResult> {
     try {
-      if (onProgress) onProgress('正在获取微信进程...');
+      onProgress?.('正在查找模板文件...')
+      let result = await this._findTemplateData(accountPath, 32)
+      let { ciphertext, xorKey } = result
+
+      if (ciphertext && xorKey === null) {
+        onProgress?.('未找到有效密钥，尝试扫描更多文件...')
+        result = await this._findTemplateData(accountPath, 100)
+        xorKey = result.xorKey
+      }
+
+      if (!ciphertext) return { success: false, error: '未找到 V2 模板文件，请先在微信中查看几张图片' }
+      if (xorKey === null) return { success: false, error: '未能从模板文件中计算出有效的 XOR 密钥' }
+
+      onProgress?.(`XOR 密钥: 0x${xorKey.toString(16).padStart(2, '0')}，正在查找微信进程...`)
+
+      // 2. 找微信 PID
       const { stdout } = await execAsync('pidof wechat wechat-bin xwechat').catch(() => ({ stdout: '' }))
       const pids = stdout.trim().split(/\s+/).filter(p => p)
       if (pids.length === 0) return { success: false, error: '微信未运行，无法扫描内存' }
       const pid = parseInt(pids[0], 10)
 
-      if (onProgress) onProgress('正在提取图片特征码...');
-      const ciphertextHex = this.findAnyDatCiphertext(accountPath)
-      if (!ciphertextHex) {
-        return { success: false, error: '未在 FileStorage/Image 找到缓存图片，请在微信中随便点开一张大图后重试' }
-      }
+      onProgress?.(`已找到微信进程 PID=${pid}，正在提权扫描进程内存...`);
 
-      if (onProgress) onProgress('正在提权扫描进程内存...');
+      // 3. 将 Buffer 转换为 hex 传递给 helper
+      const ciphertextHex = ciphertext.toString('hex')
       const helperPath = this.getHelperPath()
-      const { stdout: memOut } = await execFileAsync(helperPath, ['image_mem', pid.toString(), ciphertextHex])
-      const res = JSON.parse(memOut.trim())
 
-      if (res.success) {
-        if (onProgress) onProgress('内存扫描成功');
-        return { success: true, aesKey: res.key }
-      }
-      return { success: false, error: res.result }
-    } catch (err: any) {
-      return { success: false, error: err.message }
-    }
-  }
-  private findAnyDatCiphertext(accountPath: string): string | null {
-    try {
-      const imgDir = join(accountPath, 'FileStorage', 'Image')
-      if (!existsSync(imgDir)) return null
+      try {
+        console.log(`[Debug] 准备执行 Helper: ${helperPath} image_mem ${pid} ${ciphertextHex}`);
 
-      const months = readdirSync(imgDir).filter(f => !f.startsWith('.') && statSync(join(imgDir, f)).isDirectory())
-      months.sort((a, b) => b.localeCompare(a))
+        const { stdout: memOut, stderr } = await execFileAsync(helperPath, ['image_mem', pid.toString(), ciphertextHex])
 
-      for (const month of months) {
-        const monthDir = join(imgDir, month)
-        const files = readdirSync(monthDir).filter(f => f.endsWith('.dat'))
-        if (files.length > 0) {
-          const target = join(monthDir, files[0])
-          const buffer = readFileSync(target)
-          if (buffer.length >= 16) {
-            return buffer.subarray(0, 16).toString('hex')
-          }
+        console.log(`[Debug] Helper stdout: ${memOut}`);
+        if (stderr) {
+          console.warn(`[Debug] Helper stderr: ${stderr}`);
+        }
+
+        if (!memOut || memOut.trim() === '') {
+          return { success: false, error: 'Helper 返回为空，请检查是否有足够的权限(如需sudo)读取进程内存。' }
+        }
+
+        const res = JSON.parse(memOut.trim())
+
+        if (res.success) {
+          onProgress?.('内存扫描成功');
+          return { success: true, xorKey, aesKey: res.key }
+        }
+        return { success: false, error: res.result || '未知错误' }
+
+      } catch (err: any) {
+        console.error('[Debug] 执行或解析 Helper 时发生崩溃:', err);
+        return {
+          success: false,
+          error: `内存扫描失败: ${err.message}\nstdout: ${err.stdout || '无'}\nstderr: ${err.stderr || '无'}`
         }
       }
-    } catch (e) {
-      console.error('[Linux KeyService] 查找 .dat 失败:', e)
+    } catch (err: any) {
+      return { success: false, error: `内存扫描失败: ${err.message}` }
     }
-    return null
+  }
+
+  private async _findTemplateData(userDir: string, limit: number = 32): Promise<{ ciphertext: Buffer | null; xorKey: number | null }> {
+    const V2_MAGIC = Buffer.from([0x07, 0x08, 0x56, 0x32, 0x08, 0x07])
+
+    // 递归收集 *_t.dat 文件
+    const collect = (dir: string, results: string[], maxFiles: number) => {
+      if (results.length >= maxFiles) return
+      try {
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+          if (results.length >= maxFiles) break
+          const full = join(dir, entry.name)
+          if (entry.isDirectory()) collect(full, results, maxFiles)
+          else if (entry.isFile() && entry.name.endsWith('_t.dat')) results.push(full)
+        }
+      } catch { /* 忽略无权限目录 */ }
+    }
+
+    const files: string[] = []
+    collect(userDir, files, limit)
+
+    // 按修改时间降序
+    files.sort((a, b) => {
+      try { return statSync(b).mtimeMs - statSync(a).mtimeMs } catch { return 0 }
+    })
+
+    let ciphertext: Buffer | null = null
+    const tailCounts: Record<string, number> = {}
+
+    for (const f of files.slice(0, 32)) {
+      try {
+        const data = readFileSync(f)
+        if (data.length < 8) continue
+
+        // 统计末尾两字节用于 XOR 密钥
+        if (data.subarray(0, 6).equals(V2_MAGIC) && data.length >= 2) {
+          const key = `${data[data.length - 2]}_${data[data.length - 1]}`
+          tailCounts[key] = (tailCounts[key] ?? 0) + 1
+        }
+
+        // 提取密文（取第一个有效的）
+        if (!ciphertext && data.subarray(0, 6).equals(V2_MAGIC) && data.length >= 0x1F) {
+          ciphertext = data.subarray(0xF, 0x1F)
+        }
+      } catch { /* 忽略 */ }
+    }
+
+    // 计算 XOR 密钥
+    let xorKey: number | null = null
+    let maxCount = 0
+    for (const [key, count] of Object.entries(tailCounts)) {
+      if (count > maxCount) {
+        maxCount = count
+        const [x, y] = key.split('_').map(Number)
+        const k = x ^ 0xFF
+        if (k === (y ^ 0xD9)) xorKey = k
+      }
+    }
+
+    return { ciphertext, xorKey }
   }
 }
